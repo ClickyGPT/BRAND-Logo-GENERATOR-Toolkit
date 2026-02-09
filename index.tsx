@@ -54,6 +54,11 @@ interface Edits {
     grayscale: number;
 }
 
+interface ImagePayload {
+    data: string;
+    mimeType: string;
+}
+
 const initialEdits: Edits = {
     brightness: 100,
     contrast: 100,
@@ -109,11 +114,11 @@ const App = () => {
 
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
-    const [images, setImages] = useState<string[]>([]);
+    const [images, setImages] = useState<ImagePayload[]>([]);
     const [generatedPrompt, setGeneratedPrompt] = useState('');
     
     // State for the image editor
-    const [editingImage, setEditingImage] = useState<{ src: string; index: number } | null>(null);
+    const [editingImage, setEditingImage] = useState<(ImagePayload & { index: number }) | null>(null);
     const [edits, setEdits] = useState<Edits>(initialEdits);
     const [editHistory, setEditHistory] = useState<Edits[]>([]);
     const [currentHistoryIndex, setCurrentHistoryIndex] = useState(-1);
@@ -126,7 +131,7 @@ const App = () => {
     // Analysis State
     const [analyzing, setAnalyzing] = useState(false);
     const [analysisResult, setAnalysisResult] = useState<string | null>(null);
-    const [analyzedImage, setAnalyzedImage] = useState<string | null>(null);
+    const [analyzedImage, setAnalyzedImage] = useState<ImagePayload | null>(null);
 
     // Save state to local storage on any change to the centralized appState
     useEffect(() => {
@@ -222,13 +227,16 @@ const App = () => {
             }
 
             const responses = await Promise.all([generateOne(), generateOne()]);
-            const newImages: string[] = [];
+            const newImages: ImagePayload[] = [];
 
             responses.forEach(response => {
                 if (response.candidates && response.candidates[0].content.parts) {
                     for (const part of response.candidates[0].content.parts) {
                         if (part.inlineData) {
-                            newImages.push(part.inlineData.data);
+                            newImages.push({
+                                data: part.inlineData.data,
+                                mimeType: part.inlineData.mimeType ?? 'image/jpeg',
+                            });
                         }
                     }
                 }
@@ -268,7 +276,7 @@ const App = () => {
 
         try {
             const base64 = await fileToBase64(file);
-            setAnalyzedImage(base64);
+            setAnalyzedImage({ data: base64, mimeType: file.type });
 
             const response = await ai.models.generateContent({
                 model: 'gemini-3-pro-preview',
@@ -304,8 +312,8 @@ const App = () => {
     };
 
     // Image Editor Functions
-    const openEditor = (src: string, index: number) => {
-        setEditingImage({ src, index });
+    const openEditor = (image: ImagePayload, index: number) => {
+        setEditingImage({ ...image, index });
         setEdits(initialEdits);
         setEditHistory([initialEdits]);
         setCurrentHistoryIndex(0);
@@ -317,7 +325,7 @@ const App = () => {
             const canvas = canvasRef.current;
             const ctx = canvas.getContext('2d');
             const img = new Image();
-            img.src = `data:image/jpeg;base64,${editingImage.src}`;
+            img.src = `data:${editingImage.mimeType};base64,${editingImage.data}`;
             img.onload = () => {
                 canvas.width = img.naturalWidth;
                 canvas.height = img.naturalHeight;
@@ -343,24 +351,30 @@ const App = () => {
                 model: 'gemini-2.5-flash-image',
                 contents: {
                     parts: [
-                        { inlineData: { mimeType: 'image/jpeg', data: editingImage.src } },
+                        { inlineData: { mimeType: editingImage.mimeType, data: editingImage.data } },
                         { text: aiEditPrompt }
                     ]
                 }
             });
 
             let newImageData: string | null = null;
+            let newImageMimeType: string | null = null;
             if (response.candidates && response.candidates[0].content.parts) {
                 for (const part of response.candidates[0].content.parts) {
                     if (part.inlineData) {
                         newImageData = part.inlineData.data;
+                        newImageMimeType = part.inlineData.mimeType ?? null;
                         break;
                     }
                 }
             }
 
             if (newImageData) {
-                setEditingImage({ ...editingImage, src: newImageData });
+                setEditingImage({
+                    ...editingImage,
+                    data: newImageData,
+                    mimeType: newImageMimeType ?? editingImage.mimeType,
+                });
                 // Reset manual edits as we have a new base image
                 setEdits(initialEdits);
                 setEditHistory([initialEdits]);
@@ -570,13 +584,13 @@ const App = () => {
                                         <p>Creating high-quality logo...</p>
                                     </div>
                                 ))}
-                                {!loading && images.length > 0 && images.map((imgSrc, index) => (
+                                {!loading && images.length > 0 && images.map((image, index) => (
                                     <div className="image-container" key={index}>
-                                        <img src={`data:image/jpeg;base64,${imgSrc}`} alt={`Generated Logo ${index + 1}`} />
+                                        <img src={`data:${image.mimeType};base64,${image.data}`} alt={`Generated Logo ${index + 1}`} />
                                         <div className="image-actions">
-                                            <button className="edit-button" onClick={() => openEditor(imgSrc, index)}>Edit</button>
+                                            <button className="edit-button" onClick={() => openEditor(image, index)}>Edit</button>
                                             <a
-                                                href={`data:image/jpeg;base64,${imgSrc}`}
+                                                href={`data:${image.mimeType};base64,${image.data}`}
                                                 download={`${appState.formData.brandName.replace(/\s+/g, '_') || 'logo'}-${index + 1}.jpeg`}
                                                 className="download-button"
                                                 aria-label={`Download logo ${index + 1}`}
@@ -619,7 +633,7 @@ const App = () => {
                         {analyzedImage && (
                             <div className="form-group">
                                 <label>Uploaded Image</label>
-                                <img src={`data:image/jpeg;base64,${analyzedImage}`} alt="Uploaded for analysis" className="analyzed-image-preview" />
+                                <img src={`data:${analyzedImage.mimeType};base64,${analyzedImage.data}`} alt="Uploaded for analysis" className="analyzed-image-preview" />
                             </div>
                         )}
 
