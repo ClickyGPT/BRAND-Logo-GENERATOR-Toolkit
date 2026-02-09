@@ -11,6 +11,7 @@ const LOGO_STYLES = [
 ];
 
 const ASPECT_RATIOS = ['1:1', '16:9', '9:16', '4:3', '3:4'];
+const IMAGE_SIZES = ['1K', '2K', '4K'];
 const STORAGE_KEY = 'logoPromptEngineerState';
 
 // Refined and more distinct SVG icons for logo styles
@@ -41,6 +42,8 @@ interface AppState {
     formData: FormDataState;
     selectedStyles: string[];
     aspectRatio: string;
+    imageSize: string;
+    activeTab: 'create' | 'analyze';
 }
 
 interface Edits {
@@ -63,6 +66,23 @@ const defaultState: AppState = {
     formData: { brandName: '', industry: '', visuals: '', colors: '', logoText: '' },
     selectedStyles: [],
     aspectRatio: '1:1',
+    imageSize: '1K',
+    activeTab: 'create',
+};
+
+const fileToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.readAsDataURL(file);
+        reader.onload = () => {
+            if (typeof reader.result === 'string') {
+                resolve(reader.result.split(',')[1]);
+            } else {
+                reject(new Error("Failed to convert file to base64"));
+            }
+        };
+        reader.onerror = error => reject(error);
+    });
 };
 
 const App = () => {
@@ -99,6 +119,15 @@ const App = () => {
     const [currentHistoryIndex, setCurrentHistoryIndex] = useState(-1);
     const canvasRef = useRef<HTMLCanvasElement>(null);
 
+    // AI Edit State
+    const [aiEditPrompt, setAiEditPrompt] = useState('');
+    const [aiEditing, setAiEditing] = useState(false);
+
+    // Analysis State
+    const [analyzing, setAnalyzing] = useState(false);
+    const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+    const [analyzedImage, setAnalyzedImage] = useState<string | null>(null);
+
     // Save state to local storage on any change to the centralized appState
     useEffect(() => {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(appState));
@@ -124,6 +153,14 @@ const App = () => {
     
     const handleAspectRatioChange = (ratio: string) => {
         setAppState(prev => ({ ...prev, aspectRatio: ratio }));
+    };
+
+    const handleImageSizeChange = (size: string) => {
+        setAppState(prev => ({ ...prev, imageSize: size }));
+    };
+
+    const handleTabChange = (tab: 'create' | 'analyze') => {
+        setAppState(prev => ({ ...prev, activeTab: tab }));
     };
 
     const constructPrompt = useCallback(() => {
@@ -164,19 +201,41 @@ const App = () => {
         setGeneratedPrompt(prompt);
 
         try {
-            const response = await ai.models.generateImages({
-                model: 'imagen-4.0-generate-001',
-                prompt: prompt,
-                config: {
-                    numberOfImages: 4,
-                    outputMimeType: 'image/jpeg',
-                    aspectRatio: appState.aspectRatio,
-                },
+            // Using gemini-3-pro-image-preview (Nano Banana Pro)
+            // It generates one image usually per request in the content parts. 
+            // We can try to generate multiple by calling it multiple times in parallel if we want a grid.
+            // Let's generate 2 images to be responsive but give options.
+            const generateOne = async () => {
+                 const response = await ai.models.generateContent({
+                    model: 'gemini-3-pro-image-preview',
+                    contents: {
+                        parts: [{ text: prompt }]
+                    },
+                    config: {
+                        imageConfig: {
+                            aspectRatio: appState.aspectRatio,
+                            imageSize: appState.imageSize, 
+                        },
+                    },
+                });
+                return response;
+            }
+
+            const responses = await Promise.all([generateOne(), generateOne()]);
+            const newImages: string[] = [];
+
+            responses.forEach(response => {
+                if (response.candidates && response.candidates[0].content.parts) {
+                    for (const part of response.candidates[0].content.parts) {
+                        if (part.inlineData) {
+                            newImages.push(part.inlineData.data);
+                        }
+                    }
+                }
             });
 
-            if (response.generatedImages && response.generatedImages.length > 0) {
-                const imageBytesArray = response.generatedImages.map(img => img.image.imageBytes);
-                setImages(imageBytesArray);
+            if (newImages.length > 0) {
+                setImages(newImages);
             } else {
                 setError('The API did not return any images. Please try refining your prompt.');
             }
@@ -185,19 +244,50 @@ const App = () => {
             let friendlyErrorMessage = 'An unexpected error occurred while generating the logo. Please try again later.';
             if (e instanceof Error) {
                 const errorMessage = e.message.toLowerCase();
-                if (errorMessage.includes('api key not valid')) {
+                if (errorMessage.includes('api key')) {
                     friendlyErrorMessage = 'Invalid API Key. Please ensure your API key is correctly configured.';
-                } else if (errorMessage.includes('rate limit')) {
+                } else if (errorMessage.includes('quota') || errorMessage.includes('limit')) {
                     friendlyErrorMessage = 'You have exceeded the request limit. Please wait a while before trying again.';
-                } else if (errorMessage.includes('prompt was blocked')) {
+                } else if (errorMessage.includes('blocked')) {
                     friendlyErrorMessage = 'Your prompt was blocked due to safety concerns. Please modify your prompt and try again.';
-                } else {
-                    friendlyErrorMessage = 'An error occurred while generating the logo. Please check your input and try again.';
                 }
             }
             setError(friendlyErrorMessage);
         } finally {
             setLoading(false);
+        }
+    };
+
+    const handleAnalyzeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setAnalyzing(true);
+        setAnalysisResult(null);
+        setError(null);
+
+        try {
+            const base64 = await fileToBase64(file);
+            setAnalyzedImage(base64);
+
+            const response = await ai.models.generateContent({
+                model: 'gemini-3-pro-preview',
+                contents: {
+                    parts: [
+                        { inlineData: { mimeType: file.type, data: base64 } },
+                        { text: "Analyze this logo design. Describe its style, colors, visual elements, and industry fit. Then, provide a detailed prompt that could be used to generate a similar logo." }
+                    ]
+                }
+            });
+
+            if (response.text) {
+                setAnalysisResult(response.text);
+            }
+        } catch (err) {
+            console.error(err);
+            setError("Failed to analyze the image. Please try again.");
+        } finally {
+            setAnalyzing(false);
         }
     };
     
@@ -208,6 +298,8 @@ const App = () => {
             setImages([]);
             setError(null);
             setGeneratedPrompt('');
+            setAnalysisResult(null);
+            setAnalyzedImage(null);
         }
     };
 
@@ -217,6 +309,7 @@ const App = () => {
         setEdits(initialEdits);
         setEditHistory([initialEdits]);
         setCurrentHistoryIndex(0);
+        setAiEditPrompt('');
     };
     
     const applyCanvasFilters = useCallback(() => {
@@ -239,6 +332,51 @@ const App = () => {
     useEffect(() => {
         applyCanvasFilters();
     }, [applyCanvasFilters]);
+
+    const handleAiEdit = async () => {
+        if (!editingImage || !aiEditPrompt) return;
+        setAiEditing(true);
+        
+        try {
+            // Use Gemini 2.5 Flash Image for editing
+            const response = await ai.models.generateContent({
+                model: 'gemini-2.5-flash-image',
+                contents: {
+                    parts: [
+                        { inlineData: { mimeType: 'image/jpeg', data: editingImage.src } },
+                        { text: aiEditPrompt }
+                    ]
+                }
+            });
+
+            let newImageData: string | null = null;
+            if (response.candidates && response.candidates[0].content.parts) {
+                for (const part of response.candidates[0].content.parts) {
+                    if (part.inlineData) {
+                        newImageData = part.inlineData.data;
+                        break;
+                    }
+                }
+            }
+
+            if (newImageData) {
+                setEditingImage({ ...editingImage, src: newImageData });
+                // Reset manual edits as we have a new base image
+                setEdits(initialEdits);
+                setEditHistory([initialEdits]);
+                setCurrentHistoryIndex(0);
+                setAiEditPrompt('');
+            } else {
+                alert("The AI couldn't perform the edit. Try a different prompt.");
+            }
+
+        } catch (e) {
+            console.error(e);
+            alert("Error performing AI edit.");
+        } finally {
+            setAiEditing(false);
+        }
+    };
 
     const handleDownloadEdited = () => {
         if (canvasRef.current && editingImage) {
@@ -333,94 +471,169 @@ const App = () => {
         <>
             <header>
                 <h1>Brand Logo Prompt Engineer</h1>
-                <p>Craft the perfect prompt and generate your brand's logo with AI.</p>
+                <p>Craft the perfect prompt, generate logos with AI, or analyze existing designs.</p>
             </header>
+            <div className="tabs">
+                <button 
+                    className={`tab-button ${appState.activeTab === 'create' ? 'active' : ''}`}
+                    onClick={() => handleTabChange('create')}
+                >
+                    Create Logo
+                </button>
+                <button 
+                    className={`tab-button ${appState.activeTab === 'analyze' ? 'active' : ''}`}
+                    onClick={() => handleTabChange('analyze')}
+                >
+                    Analyze Logo
+                </button>
+            </div>
             <main>
-                <section className="form-section">
-                    {renderInputField('brandName', '1. Brand Name', 'Your Brand\'s Name Here')}
-                    {renderInputField('industry', '2. Industry/Niche', 'e.g., Artisan Coffee Roaster, Tech Startup')}
-                    <div className="form-group">
-                        <label>3. Desired Logo Style/Aesthetics <span>(Choose up to 3)</span></label>
-                        <div className="style-options">
-                            {LOGO_STYLES.map(style => (
-                                <button
-                                    key={style}
-                                    className={`style-option ${appState.selectedStyles.includes(style) ? 'selected' : ''}`}
-                                    onClick={() => toggleStyle(style)}
-                                >
-                                    {styleIcons[style]}
-                                    {style}
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-                    {renderInputField('visuals', '4. Key Visual Elements (Optional)', 'e.g., A subtle leaf, interlocking gears', true)}
-                    {renderInputField('colors', '5. Preferred Color Palette (Optional)', 'e.g., Blues and greens for trust and growth', true)}
-                    {renderInputField('logoText', '6. Logo Text: Brand Name & Captions', 'e.g., "Innovate" or "Innovate Forward"', true)}
-                    
-                    <div className="form-group">
-                        <label>7. Aspect Ratio</label>
-                        <div className="style-options aspect-ratios">
-                            {ASPECT_RATIOS.map(ratio => (
-                                <button
-                                    key={ratio}
-                                    className={`style-option aspect-ratio-button ${appState.aspectRatio === ratio ? 'selected' : ''}`}
-                                    onClick={() => handleAspectRatioChange(ratio)}
-                                >
-                                    <div className="aspect-ratio-preview" style={getAspectRatioStyles(ratio)}></div>
-                                    <span>{ratio}</span>
-                                </button>
-                            ))}
-                        </div>
-                    </div>
-                    
-                    <div className="form-actions">
-                        <button className="generate-button" onClick={handleGenerate} disabled={loading}>
-                            {loading && <div className="spinner button-spinner"></div>}
-                            {loading ? 'Generating...' : 'Generate Logo'}
-                        </button>
-                         <button className="reset-button" onClick={handleReset} disabled={loading}>Reset Form</button>
-                    </div>
-
-                    {error && <p className="error-message">{error}</p>}
-                </section>
-
-                <section className="results-section">
-                    <h2>Generated Logos</h2>
-                    {generatedPrompt && (
-                         <div className="form-group">
-                            <label>Final Prompt Sent to AI</label>
-                            <div className="prompt-preview">{generatedPrompt}</div>
-                         </div>
-                    )}
-                    <div className="image-grid">
-                        {loading && Array.from({ length: 4 }).map((_, i) => (
-                             <div key={i} className="placeholder">
-                                <div className="spinner"></div>
-                                <p>The AI is working...</p>
-                             </div>
-                        ))}
-                        {!loading && images.length > 0 && images.map((imgSrc, index) => (
-                            <div className="image-container" key={index}>
-                                <img src={`data:image/jpeg;base64,${imgSrc}`} alt={`Generated Logo ${index + 1}`} />
-                                <div className="image-actions">
-                                    <button className="edit-button" onClick={() => openEditor(imgSrc, index)}>Edit</button>
-                                    <a
-                                        href={`data:image/jpeg;base64,${imgSrc}`}
-                                        download={`${appState.formData.brandName.replace(/\s+/g, '_') || 'logo'}-${index + 1}.jpeg`}
-                                        className="download-button"
-                                        aria-label={`Download logo ${index + 1}`}
-                                    >
-                                        Download
-                                    </a>
+                {appState.activeTab === 'create' ? (
+                    <>
+                        <section className="form-section">
+                            {renderInputField('brandName', '1. Brand Name', 'Your Brand\'s Name Here')}
+                            {renderInputField('industry', '2. Industry/Niche', 'e.g., Artisan Coffee Roaster, Tech Startup')}
+                            <div className="form-group">
+                                <label>3. Desired Logo Style/Aesthetics <span>(Choose up to 3)</span></label>
+                                <div className="style-options">
+                                    {LOGO_STYLES.map(style => (
+                                        <button
+                                            key={style}
+                                            className={`style-option ${appState.selectedStyles.includes(style) ? 'selected' : ''}`}
+                                            onClick={() => toggleStyle(style)}
+                                        >
+                                            {styleIcons[style]}
+                                            {style}
+                                        </button>
+                                    ))}
                                 </div>
                             </div>
-                        ))}
-                         {!loading && images.length === 0 && Array.from({ length: 4 }).map((_, i) => (
-                             <div key={i} className="placeholder">{ i === 0 && <p>Your logos will appear here</p>}</div>
-                        ))}
-                    </div>
-                </section>
+                            {renderInputField('visuals', '4. Key Visual Elements (Optional)', 'e.g., A subtle leaf, interlocking gears', true)}
+                            {renderInputField('colors', '5. Preferred Color Palette (Optional)', 'e.g., Blues and greens for trust and growth', true)}
+                            {renderInputField('logoText', '6. Logo Text: Brand Name & Captions', 'e.g., "Innovate" or "Innovate Forward"', true)}
+                            
+                            <div className="form-row" style={{ display: 'flex', gap: '2rem' }}>
+                                <div className="form-group" style={{ flex: 1 }}>
+                                    <label>7. Aspect Ratio</label>
+                                    <div className="style-options aspect-ratios">
+                                        {ASPECT_RATIOS.map(ratio => (
+                                            <button
+                                                key={ratio}
+                                                className={`style-option aspect-ratio-button ${appState.aspectRatio === ratio ? 'selected' : ''}`}
+                                                onClick={() => handleAspectRatioChange(ratio)}
+                                            >
+                                                <div className="aspect-ratio-preview" style={getAspectRatioStyles(ratio)}></div>
+                                                <span>{ratio}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                                <div className="form-group" style={{ flex: 1 }}>
+                                    <label>8. Image Size</label>
+                                    <div className="style-options aspect-ratios">
+                                        {IMAGE_SIZES.map(size => (
+                                            <button
+                                                key={size}
+                                                className={`style-option aspect-ratio-button ${appState.imageSize === size ? 'selected' : ''}`}
+                                                onClick={() => handleImageSizeChange(size)}
+                                            >
+                                                <span style={{ fontSize: '1.2em', fontWeight: 'bold' }}>{size}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <div className="form-actions">
+                                <button className="generate-button" onClick={handleGenerate} disabled={loading}>
+                                    {loading && <div className="spinner button-spinner"></div>}
+                                    {loading ? 'Generating...' : 'Generate Logo'}
+                                </button>
+                                <button className="reset-button" onClick={handleReset} disabled={loading}>Reset Form</button>
+                            </div>
+
+                            {error && <p className="error-message">{error}</p>}
+                        </section>
+
+                        <section className="results-section">
+                            <h2>Generated Logos</h2>
+                            {generatedPrompt && (
+                                <div className="form-group">
+                                    <label>Final Prompt Sent to AI</label>
+                                    <div className="prompt-preview">{generatedPrompt}</div>
+                                </div>
+                            )}
+                            <div className="image-grid">
+                                {loading && Array.from({ length: 2 }).map((_, i) => (
+                                    <div key={i} className="placeholder">
+                                        <div className="spinner"></div>
+                                        <p>Creating high-quality logo...</p>
+                                    </div>
+                                ))}
+                                {!loading && images.length > 0 && images.map((imgSrc, index) => (
+                                    <div className="image-container" key={index}>
+                                        <img src={`data:image/jpeg;base64,${imgSrc}`} alt={`Generated Logo ${index + 1}`} />
+                                        <div className="image-actions">
+                                            <button className="edit-button" onClick={() => openEditor(imgSrc, index)}>Edit</button>
+                                            <a
+                                                href={`data:image/jpeg;base64,${imgSrc}`}
+                                                download={`${appState.formData.brandName.replace(/\s+/g, '_') || 'logo'}-${index + 1}.jpeg`}
+                                                className="download-button"
+                                                aria-label={`Download logo ${index + 1}`}
+                                            >
+                                                Download
+                                            </a>
+                                        </div>
+                                    </div>
+                                ))}
+                                {!loading && images.length === 0 && (
+                                    <div className="placeholder" style={{ gridColumn: '1 / -1' }}>
+                                        <p>Your logos will appear here</p>
+                                    </div>
+                                )}
+                            </div>
+                        </section>
+                    </>
+                ) : (
+                    <section className="form-section" style={{ gridColumn: '1 / -1' }}>
+                        <h2>Analyze Existing Logo</h2>
+                        <p>Upload an image of a logo to get a breakdown of its style, potential prompts, and design elements.</p>
+                        
+                        <div className="file-upload-area">
+                            <input 
+                                type="file" 
+                                accept="image/*" 
+                                onChange={handleAnalyzeUpload} 
+                                className="file-upload-input"
+                            />
+                            {analyzing ? (
+                                <div className="spinner"></div>
+                            ) : (
+                                <>
+                                    <span style={{ fontSize: '2rem', display: 'block', marginBottom: '1rem' }}>📂</span>
+                                    <p>Click or Drag to Upload Image</p>
+                                </>
+                            )}
+                        </div>
+
+                        {analyzedImage && (
+                            <div className="form-group">
+                                <label>Uploaded Image</label>
+                                <img src={`data:image/jpeg;base64,${analyzedImage}`} alt="Uploaded for analysis" className="analyzed-image-preview" />
+                            </div>
+                        )}
+
+                        {analysisResult && (
+                            <div className="form-group">
+                                <label>Analysis Result</label>
+                                <div className="analysis-result">
+                                    {analysisResult}
+                                </div>
+                            </div>
+                        )}
+                        {error && <p className="error-message">{error}</p>}
+                    </section>
+                )}
             </main>
             
             {editingImage && (
@@ -435,11 +648,32 @@ const App = () => {
                                 <canvas ref={canvasRef}></canvas>
                             </div>
                             <div className="edit-controls">
-                                {renderRangeInput('brightness', 'Brightness', 0, 200, '%')}
-                                {renderRangeInput('contrast', 'Contrast', 0, 200, '%')}
-                                {renderRangeInput('saturation', 'Saturation', 0, 200, '%')}
-                                {renderRangeInput('hue', 'Hue', 0, 360, 'deg')}
-                                {renderRangeInput('grayscale', 'Grayscale', 0, 100, '%')}
+                                <div className="control-section">
+                                    <h3>Manual Adjustments</h3>
+                                    {renderRangeInput('brightness', 'Brightness', 0, 200, '%')}
+                                    {renderRangeInput('contrast', 'Contrast', 0, 200, '%')}
+                                    {renderRangeInput('saturation', 'Saturation', 0, 200, '%')}
+                                    {renderRangeInput('hue', 'Hue', 0, 360, 'deg')}
+                                    {renderRangeInput('grayscale', 'Grayscale', 0, 100, '%')}
+                                </div>
+                                <div className="ai-edit-section">
+                                    <h3>AI Edit (Nano Banana)</h3>
+                                    <p style={{fontSize: '0.875rem', color: '#a0a0a0', marginBottom: '0.5rem'}}>
+                                        Describe what you want to change (e.g., "Add a retro filter", "Remove text").
+                                    </p>
+                                    <div className="ai-edit-controls">
+                                        <input 
+                                            type="text" 
+                                            value={aiEditPrompt} 
+                                            onChange={(e) => setAiEditPrompt(e.target.value)} 
+                                            placeholder="Enter edit instruction..."
+                                            disabled={aiEditing}
+                                        />
+                                        <button className="primary-button" onClick={handleAiEdit} disabled={aiEditing || !aiEditPrompt}>
+                                            {aiEditing ? 'Editing...' : 'Generate'}
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                         <div className="modal-footer">
